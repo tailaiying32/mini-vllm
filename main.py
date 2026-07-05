@@ -1,13 +1,16 @@
 import asyncio
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import torch
 
-from engine import prepare_request, generate_one_token
+from transformers.cache_utils import DynamicCache
+
+from engine import StepResult, prepare_request, prefill_one_token, batch_decode_one_token
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -25,9 +28,14 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
-# define the FastAPI app with the REQUEST_QUEUE as a global variable
 app = FastAPI(title="Mini-vLLM", lifespan=lifespan)
 REQUEST_QUEUE = asyncio.Queue()
+
+
+class RequestPhase(Enum):
+    PREFILL = "prefill"
+    DECODE = "decode"
+
 
 class CompletionRequest(BaseModel):
     """
@@ -48,7 +56,8 @@ class InferenceRequest:
     max_tokens: int
     output_queue: asyncio.Queue
     input_ids: torch.Tensor
-    past_key_values: tuple | None = None
+    past_key_values: DynamicCache | None = None
+    phase: RequestPhase = RequestPhase.PREFILL
     generated_count: int = 0
     finished: bool = False
 
@@ -56,11 +65,7 @@ class InferenceRequest:
 async def stream_tokens(output_queue: asyncio.Queue):
     """
     Stream tokens from the output queue.
-
-    @param output_queue: The queue to stream tokens from.
-    @return: A generator that yields tokens.
     """
-
     while True:
         token = await output_queue.get()
         if token is None:
@@ -68,17 +73,25 @@ async def stream_tokens(output_queue: asyncio.Queue):
         yield token
 
 
+async def apply_step_result(request: InferenceRequest, result: StepResult):
+    request.input_ids = result.input_ids
+    request.past_key_values = result.past_key_values
+    request.phase = RequestPhase.DECODE
+
+    if result.token_text is not None:
+        await request.output_queue.put(result.token_text)
+        request.generated_count += 1
+
+    if result.is_done or request.generated_count >= request.max_tokens:
+        request.finished = True
+        await request.output_queue.put(None)
+
+
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest):
     """
-    Handle a completion request. 
-    This function creates a new inference request and adds it to the request queue.
-    It then streams the tokens from the output queue to the client.
-
-    @param request: The completion request.
-    @return: A streaming response of tokens.
+    Handle a completion request.
     """
-
     output_queue = asyncio.Queue()
 
     inference_request = InferenceRequest(
@@ -95,7 +108,7 @@ async def completions(request: CompletionRequest):
 
 async def engine_loop():
     """
-    Round-robin scheduler: advance each active request by one token per cycle.
+    Continuous batching scheduler: batched decode + one prefill per cycle.
     """
     active_requests: list[InferenceRequest] = []
 
@@ -107,35 +120,27 @@ async def engine_loop():
             await asyncio.sleep(0.001)
             continue
 
-        still_active = []
+        prefill_requests = [
+            r for r in active_requests
+            if not r.finished and r.phase == RequestPhase.PREFILL
+        ]
+        decode_requests = [
+            r for r in active_requests
+            if not r.finished and r.phase == RequestPhase.DECODE
+        ]
 
-        for request in active_requests:
-            if request.finished:
-                continue
+        if decode_requests:
+            results = batch_decode_one_token(decode_requests)
+            for request, result in zip(decode_requests, results):
+                await apply_step_result(request, result)
 
-            if request.generated_count >= request.max_tokens:
-                request.finished = True
-                await request.output_queue.put(None)
-                continue
+        if prefill_requests:
+            request = prefill_requests[0]
+            result = prefill_one_token(request.input_ids)
+            await apply_step_result(request, result)
 
-            request.input_ids, token_text, is_done, request.past_key_values = generate_one_token(
-                request.input_ids,
-                request.past_key_values,
-            )
-
-            if token_text is not None:
-                await request.output_queue.put(token_text)
-                request.generated_count += 1
-
-            if is_done or request.generated_count >= request.max_tokens:
-                request.finished = True
-                await request.output_queue.put(None)
-            else:
-                still_active.append(request)
-
-            await asyncio.sleep(0)
-
-        active_requests = still_active
+        active_requests = [r for r in active_requests if not r.finished]
+        await asyncio.sleep(0)
 
 
 if __name__ == "__main__":
