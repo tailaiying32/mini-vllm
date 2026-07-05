@@ -62,6 +62,60 @@ def prepare_request(prompt: str) -> torch.Tensor:
     return tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
 
+def batch_prepare_requests(prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Left-pad prompts to max length and build an attention mask."""
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    encoded = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+    )
+    return encoded.input_ids.to(device), encoded.attention_mask.to(device)
+
+
+def batch_prefill_one_token(requests: list) -> list[StepResult]:
+    """Run batched prefill for multiple requests. Each request has .input_ids [1, seq]."""
+    if not requests:
+        return []
+
+    if len(requests) == 1:
+        return [prefill_one_token(requests[0].input_ids)]
+
+    prompts = [r.prompt for r in requests]
+    batched_input_ids, attention_mask = batch_prepare_requests(prompts)
+    # Left-padded batches are right-aligned; last token is always at the final column.
+    last_token_indices = torch.full(
+        (len(requests),),
+        batched_input_ids.shape[1] - 1,
+        device=batched_input_ids.device,
+        dtype=torch.long,
+    )
+
+    with torch.inference_mode():
+        output = model(
+            batched_input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
+
+    per_request_caches = unstack_past_key_values(output.past_key_values, len(requests))
+    results: list[StepResult] = []
+
+    for i, request in enumerate(requests):
+        idx = last_token_indices[i].item()
+        next_token_id = torch.argmax(
+            output.logits[i : i + 1, idx, :], dim=-1, keepdim=True
+        )
+        results.append(
+            _build_step_result(request.input_ids, next_token_id, per_request_caches[i])
+        )
+
+    return results
+
+
 def _build_step_result(
     input_ids: torch.Tensor,
     next_token_id: torch.Tensor,
