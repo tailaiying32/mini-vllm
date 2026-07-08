@@ -10,11 +10,13 @@ import torch
 
 from engine import (
     MODEL_ID,
+    batch_decode_one_token,
+    batch_prefill_one_token,
+    generate_one_token,
     generate_tokens,
     model,
     prepare_request,
     prefill_one_token,
-    batch_prefill_one_token,
     tokenizer,
 )
 
@@ -23,6 +25,15 @@ class _PrefillRequest:
     def __init__(self, prompt: str):
         self.prompt = prompt
         self.input_ids = prepare_request(prompt)
+
+
+class _DecodeRequest:
+    def __init__(self, prompt: str):
+        self.prompt = prompt
+        self.input_ids = prepare_request(prompt)
+        result = prefill_one_token(self.input_ids)
+        self.input_ids = result.input_ids
+        self.kv_state = result.kv_state
 
 
 def naive_greedy(prompt: str, max_tokens: int) -> str:
@@ -64,6 +75,26 @@ def verify_batched_prefill(prompts: list[str]) -> None:
             sys.exit(1)
 
     print(f"OK batched prefill parity ({len(prompts)} prompts)")
+
+
+def verify_heterogeneous_decode() -> None:
+    """Different sequence lengths in one decode batch must match sequential decode."""
+    prompts = ["Hi", "The capital of France is", "Once upon a time in a land far away"]
+
+    sequential_ids = []
+    for prompt in prompts:
+        request = _DecodeRequest(prompt)
+        result = generate_one_token(request.input_ids, request.kv_state)
+        sequential_ids.append(result.input_ids[0].tolist())
+
+    batched_requests = [_DecodeRequest(p) for p in prompts]
+    batched = batch_decode_one_token(batched_requests)
+    for i, (prompt, result) in enumerate(zip(prompts, batched)):
+        if result.input_ids[0].tolist() != sequential_ids[i]:
+            print(f"FAIL heterogeneous decode on prompt {prompt!r}")
+            sys.exit(1)
+
+    print(f"OK heterogeneous decode parity ({len(prompts)} prompts)")
 
 
 async def verify_http_parity(prompt: str, max_tokens: int, base_url: str) -> None:
@@ -112,6 +143,7 @@ def main() -> None:
         "Once upon a time",
         "Hello",
     ])
+    verify_heterogeneous_decode()
 
     if args.http:
         asyncio.run(verify_http_parity(args.prompt, args.max_tokens, args.base_url))

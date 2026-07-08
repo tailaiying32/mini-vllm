@@ -9,13 +9,14 @@ import torch
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from transformers.cache_utils import DynamicCache
 
+from cache.paged_state import PagedKVState
 from engine import (
     StepResult,
-    prepare_request,
     batch_decode_one_token,
     batch_prefill_one_token,
+    free_kv_state,
+    prepare_request,
 )
 
 INFERENCE_EXECUTOR = ThreadPoolExecutor(max_workers=1)
@@ -78,7 +79,7 @@ class InferenceRequest:
     max_tokens: int
     output_queue: asyncio.Queue
     input_ids: torch.Tensor
-    past_key_values: DynamicCache | None = None
+    kv_state: PagedKVState | None = None
     phase: RequestPhase = RequestPhase.PREFILL
     generated_count: int = 0
     finished: bool = False
@@ -116,7 +117,7 @@ async def stream_tokens(output_queue: asyncio.Queue, raw_request: Request, infer
 
 async def apply_step_result(request: InferenceRequest, result: StepResult):
     request.input_ids = result.input_ids
-    request.past_key_values = result.past_key_values
+    request.kv_state = result.kv_state
     request.phase = RequestPhase.DECODE
 
     if result.token_text is not None:
@@ -126,6 +127,11 @@ async def apply_step_result(request: InferenceRequest, result: StepResult):
     if result.is_done or request.generated_count >= request.max_tokens:
         request.finished = True
         await request.output_queue.put(None)
+
+
+def _release_request_blocks(request: InferenceRequest) -> None:
+    free_kv_state(request.kv_state)
+    request.kv_state = None
 
 
 async def run_inference(fn, *args):
@@ -161,6 +167,8 @@ async def completions(request: CompletionRequest, raw_request: Request):
             if token is None:
                 break
             tokens.append(token)
+        if inference_request.cancelled:
+            _release_request_blocks(inference_request)
         return {
             "choices": [{"text": "".join(tokens)}],
             "model": request.model or "Qwen/Qwen2.5-0.5B-Instruct",
@@ -216,6 +224,10 @@ async def engine_loop():
             for request, result in zip(prefill_requests, results):
                 if not request.cancelled:
                     await apply_step_result(request, result)
+
+        for request in active_requests:
+            if request.finished or request.cancelled:
+                _release_request_blocks(request)
 
         active_requests = [
             r for r in active_requests if not r.finished and not r.cancelled
